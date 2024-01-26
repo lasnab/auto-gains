@@ -1,114 +1,86 @@
-import openai
-import pandas as pd
-from datetime import datetime
-import logging
-import logging.handlers
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate, PromptTemplate
+from langchain_community.document_loaders import YoutubeLoader
+import tiktoken
+import streamlit as st
+from langchain.schema import HumanMessage
 
-# Retrieve topic from csv
-def get_topic(filename):
-    topics = pd.read_csv(filename)
-    topics = topics.fillna('')
-    
-    try: 
-        topic_index = topics[topics.isUsed == False].index
-        topic_index[0]
-    except:
-        print('get_topic: No Available Topics Found :(')
-        return None
+GPT_MODEL = "gpt-3.5-turbo-1106"
 
-    current_time = datetime.now()
+BLOG_PROMPT_VANILLA = """I want you to act as a blogger and a {category} industry expert. The topic of the post will be {topic}. This post should be helpful for people who care about {category}. The length of the blog post will be around {word_count} words.You should be writing as an individual blogger with a personal approach so do not use plural first-person to refer to yourself e.g. “our”, “we”. Only use singular first-person. Do not use passive voice. Break the blog post down into relevant sections rather than one long paragraph. Make it so it is easily readable by a 4th grader. Only include the blog content, nothing else. """
+BLOG_PROMPT_WTH_VIDEO = """I want you to act as a blogger and a {category} industry expert. The topic of the post will be {topic}. This post should be helpful for people who care about {category}. The length of the blog post will be around {word_count} words.You should be writing as an individual blogger with a personal approach so do not use plural first-person to refer to yourself e.g. “our”, “we”. Only use singular first-person. Do not use passive voice. Break the blog post down into relevant sections rather than one long paragraph. Make it so it is easily readable by a 4th grader. Only include the content, no title. I am also providing a summary of the transcript of a youtube video which is related to the topic, which I want you to incorporate and reference in this blog. Here it is - {summary}"""
+SUMMARY_PROMPT = """You are a video transcript summarizer."""
 
-    topics.loc[topic_index[0], 'isUsed'] = True
-    topics.loc[topic_index[0], 'usedOn'] = current_time
+def write_blog(topic, category, word_count, api_key, url):
+    chat = ChatOpenAI(model=GPT_MODEL, openai_api_key=api_key, max_tokens=3500)
+ 
+    system_message_prompt = SystemMessagePromptTemplate.from_template(BLOG_PROMPT_VANILLA)
+    human_template = BLOG_PROMPT_VANILLA
 
-    topics.to_csv(filename, index=False)
-    topic = topics.iloc[topic_index].to_dict(orient='records')[0]
-
-    topic['keywords'] = [s.strip() for s in topic['keywords'].split(', ')] 
-    
-    return topic
-
-# Generate prompt for chat-gpt given the topic
-def generate_blog_prompt(blog_topic):
-    # heading, topic,category,description,keywords,wordCount,freeTextPrompt,isUsed,usedOn
-    topic = blog_topic['topic']
-    heading = blog_topic['heading']
-    industry = blog_topic['industry']
-    description = blog_topic['description']
-    keywords = blog_topic['keywords']
-    wordCount = blog_topic['wordCount']
-    freeTextPrompt = blog_topic['freeTextPrompt']
-    categories = blog_topic['categories']
-
-
-    main = "I want you to act as a blogger and a {} industry expert. The topic of the post will be '{}'. This post should be helpful for people who care about {}. ".format(industry, topic, categories)
-    title = "The title of the post is {}. ".format(heading) if heading != '' else ''
-    length = "The length of the blog post will be around {} words. ".format(wordCount) if wordCount != '' else "The length of the blog post will be around 395 words. "
-    # tone = "The tone will be [informal/ helpful/ persuasive/ professional/ authoritative etc…]."
-    instructions = "You should be writing as an individual blogger with a personal approach so do not use plural first-person to refer to yourself e.g. “our”, “we”. Only use singular first-person. Do not use passive voice. Break the blog post down into relevant sections rather than one long paragraph. Make it so it is easily readable by a 4th grader."
-    keywords = "I want you to include these keywords: {}".format(' '.join(keywords)) if len(keywords) > 1 else ''
-
-    return main + title  + length + description +  instructions + keywords + freeTextPrompt
-
-# Write a blog using Chat-GPT
-def write_prompt(prompt, api_key):
-    openai.api_key = api_key
-
-    response = openai.Completion.create(
-        engine="text-davinci-002",
-        prompt=prompt,
-        max_tokens=2048,
-        n=1,
-        stop=None,
-        temperature=0.5,
+    chat_prompt = ChatPromptTemplate.from_messages(
+        [system_message_prompt]
     )
 
-    return response.choices[0].text.strip()
+    blog_response = chat(
+        chat_prompt.format_prompt(
+           topic=topic, category=category, word_count=word_count
+        ).to_messages()
+    )
 
-def create_doc_with_folder(doc_title, folder_name, credentials):    
-    # authenticate with the Google Drive API and Google Docs API using a service account
-    credentials = service_account.Credentials.from_service_account_info(credentials)
-    drive_service = build('drive', 'v3', credentials=credentials)
-    docs_service = build('docs', 'v1', credentials=credentials)
+    if url:
+        summary = summarize_video(url, api_key)
+        ammend_prompt = ChatPromptTemplate.from_messages(
+        [HumanMessagePromptTemplate.from_template("Create new blog content by including ideas from this summary of a video of the related topic - {summary}")]
+        )
+        amended_blog_response = chat(ammend_prompt.format_prompt(summary=summary).to_messages())
+        title_response = chat([HumanMessage(content="Generate a catchy title for this blog")])
+        return title_response.content, amended_blog_response.content
 
+
+    return title_response.content, blog_response.content
+
+
+def summarize_video(url, api_key):
+    transcript = get_transcript(url)
+    token_count = count_tokens(transcript)
+
+    if token_count > 10001:
+        st.error("Video is too long i.e. >10001 tokens. Try a shorter video", icon="🚨")
+        return
+    
+    chat = ChatOpenAI(model=GPT_MODEL, openai_api_key=api_key)
+    system_message_prompt = SystemMessagePromptTemplate.from_template(SUMMARY_PROMPT)
+    human_template = """Summarize this transcript in 250 words - ```{transcript}```"""
+    human_message_prompt = HumanMessagePromptTemplate.from_template(human_template)
+
+    chat_prompt = ChatPromptTemplate.from_messages(
+        [system_message_prompt, human_message_prompt]
+    )
+
+    summary_response = chat(
+        chat_prompt.format_prompt(
+           transcript=transcript
+        ).to_messages()
+    )
+
+    return summary_response.content
+
+
+def get_transcript(url: str) -> str:
     try:
-        # create the folder in the root directory of the Google Drive
-        folder_metadata = {
-            'name': folder_name,
-            'mimeType': 'application/vnd.google-apps.folder'
-        }
-        folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+        loader = YoutubeLoader.from_youtube_url(url, add_video_info=False)
+        docs = loader.load()
+        if docs:
+            doc = docs[0]
+            transcript = doc.page_content
+            return transcript
+    except Exception as e:
+        st.error("Failed to load transcript from URL. Check Link!", icon="🚨")
+        return
 
-        # create the Google Doc inside the folder
-        doc_metadata = {
-            'title': doc_title,
-            'parents': [folder.get('id')],
-            'mimeType': 'application/vnd.google-apps.document'
-        }
-        doc = docs_service.documents().create(body=doc_metadata).execute()
 
-        print(f'Created Google Doc "{doc_title}" with folder "{folder_name}"')
-    except HttpError as error:
-        print(f'An error occurred: {error}')
-        doc = None
-
-    return doc
-    
-
-def setup_logger():
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    logger_file_handler = logging.handlers.RotatingFileHandler(
-        "status.log",
-        maxBytes=1024 * 1024,
-        backupCount=1,
-        encoding="utf8",
-    )
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    logger_file_handler.setFormatter(formatter)
-    logger.addHandler(logger_file_handler)
-
-    return logger
+def count_tokens(string: str) -> int:
+    """Returns the number of tokens in a text string."""
+    encoding = tiktoken.encoding_for_model(GPT_MODEL)
+    num_tokens = len(encoding.encode(string))
+    return num_tokens
