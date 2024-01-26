@@ -1,6 +1,6 @@
 # Auto-Gains: Autonomous Blog Content Generation
 
-![Auto-Gains Logo](logo.png){: width="150px"}
+<img src='logo.png' width='150'>
 
 Auto-Gains is your go-to solution for effortless blog creation, blending autonomy and muscle gains. Harnessing the power of Python, Streamlit, Open API, LangChain, and Tiktoken, this app enables users to generate captivating blog content seamlessly.
 
